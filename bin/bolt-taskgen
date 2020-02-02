@@ -1,0 +1,268 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+module XBoltTasks
+module BoltTaskGen
+  require 'json'
+  require 'parser/ruby24'
+
+  class TemplateRewriter < Parser::TreeRewriter
+    def initialize(script_name, mod_name, version, parameters)
+      @script_name = script_name
+      @mod_name = mod_name
+      @version = version
+      @parameters = parameters
+    end
+
+    # Recursively search AST for a node that matches
+    # the given type and name.
+    def grep_tree(node, type, name)
+      walker = lambda do |n|
+                 n.children.each_with_object(nil) do |c, res|
+                   next unless c.kind_of?(Parser::AST::Node)
+                   break c if (c.type == type && c.location.name.source == name)
+                   if (res = walker.call(c))
+                     break res
+                   end
+                 end
+               end
+
+      walker.call(node)
+    end
+
+    # Recursively search ast for a method invocation of the given name
+    def grep_send(node, name)
+      walker = lambda do |n|
+                 n.children.each_with_object(nil) do |c, res|
+                   next unless c.kind_of?(Parser::AST::Node)
+                   break c if (c.type == :send && c.location.selector.source == name)
+                   if (res = walker.call(c))
+                     break res
+                   end
+                 end
+               end
+
+      walker.call(node)
+    end
+
+
+    def on_module(node)
+      task_module = grep_tree(node, :module, 'BoltTaskGen')
+
+      change_name(task_module)
+      strip_children(task_module)
+      update_cli(task_module)
+    end
+
+    def on_if(node)
+      update_entrypoint(node)
+    end
+
+    def change_name(node)
+      replace(node.location.name, @mod_name)
+    end
+
+    def strip_children(node)
+      node.children.last.children.each do |child|
+        next if child.type == :class && child.location.name.source == 'CLI'
+        remove(child.location.expression)
+      end
+    end
+
+    def update_cli(node)
+      cli = grep_tree(node, :class, 'CLI')
+
+      grep_tree(cli, :casgn, 'VERSION').tap do |c|
+        replace(c.location.expression, "VERSION = '#{@version}'")
+      end
+
+      grep_tree(cli, :casgn, 'ARG_SPECS').tap do |c|
+        # FIXME: Using .inspect here to recover an array hash feels wrong.
+        replace(c.location.expression, "ARG_SPECS = #{@parameters.inspect}")
+      end
+
+      grep_send(cli, 'banner').tap do |c|
+        replace(c.location.expression,
+                "parser.banner = 'Usage: #{@script_name} [options]'")
+      end
+
+      grep_tree(cli, :def, 'main').tap do |c|
+        replace(c.children.last.location.expression,
+                "raise NotImplementedError, 'An implementation must be provided for the main function'")
+      end
+    end
+
+    def update_entrypoint(node)
+      mod_name = grep_tree(node, :const, 'BoltTaskGen')
+
+      replace(mod_name.location.name, @mod_name)
+    end
+  end
+
+  class TaskGenerator
+    def initialize(options)
+      @task = options[:task]
+    end
+
+    def process
+      raise RuntimeError, 'A value for --task must be provided' if @task.nil?
+
+      $stderr.puts('Reading task metadata: %{file}' %
+                   {file: @task})
+      task_metadata = JSON.parse(File.read(@task))
+      task_name = File.basename(@task, '.json')
+
+      mod_metadata = File.expand_path(File.join(@task,
+                                                   '..',
+                                                   '..',
+                                                   'metadata.json'))
+      $stderr.puts('Reading module metadata: %{file}' %
+                   {file: mod_metadata})
+      mod_metadata = JSON.parse(File.read(mod_metadata))
+      mod_name = mod_metadata['name'].split('-').last
+
+      name = script_name(mod_name, task_name)
+      version = mod_metadata['version']
+      parameters = script_parameters(task_metadata['parameters'])
+
+      template = File.read(__FILE__)
+      parser = Parser::Ruby24.new
+      buffer = Parser::Source::Buffer.new(task_name)
+      buffer.source = template
+      ast = parser.parse(buffer)
+
+      template_rewriter = TemplateRewriter.new(task_name, name, version, parameters)
+
+      $stdout.puts template_rewriter.rewrite(buffer, ast)
+    end
+
+    def script_name(mod_name, task_name)
+      [mod_name, task_name].map do |name|
+        name.split('_').map {|s| s[0].upcase + s[1..-1]}.join('')
+      end.join('_')
+    end
+
+    def script_parameters(params)
+      params.map do |name, dfn|
+        type = dfn['type'].match(/^(\w+)/).captures.first
+        desc = dfn['description']
+       # TODO: Better mapping of Puppet types to argument types
+        cast = case type
+               when 'Array'
+                 Array
+               else
+                 String
+               end
+
+        # TODO: handle complex Puppet types
+        ["--#{name} #{type.upcase}",
+         cast,
+         # TODO: Set Required/Optional as needed
+         # TODO: split description nicely into wrapping lines
+         desc]
+      end
+    end
+  end
+
+  class CLI
+    NAME = self.name.split('::')[-2]
+    VERSION = '0.1.0'.freeze
+    REQUIRED_RUBY_VERSION = Gem::Requirement.new('>= 2.4.0')
+    ARG_SPECS = [['--task STRING',
+                  String,
+                  'Task metadata file to process']]
+
+    def initialize(argv = [])
+      @options = {}
+      @action  = nil
+      require 'optionparser'
+
+      store_option = lambda do |hash, key, val|
+        hash[key] = val
+      end
+
+      @optparser = OptionParser.new do |parser|
+        parser.banner = 'Usage: bolt-taskgen [options]'
+
+        parser.on_tail('-h', '--help', 'Show help') do
+          @action = :show_help
+        end
+
+        parser.on_tail('--debug', 'Enable backtraces from errors') do
+          @options[:debug] = true
+        end
+
+        parser.on_tail('--version', 'Show version') do
+          @action = :show_version
+        end
+      end
+
+      ARG_SPECS.each do |spec|
+        # TODO: Yell if ARG_SPECS entry contains no --long-flag.
+        long_flag = spec.find {|e| e.start_with?('--')}.split(' ').first
+        option_name = long_flag.sub(/\A-+(?:\[no-\])?/, '').gsub('-', '_').to_sym
+
+        @optparser.on(store_option.curry[@options][option_name], *spec)
+      end
+
+      # Now that sub-parsers have been defined for each option, use them
+      # to parse PT_ environment variables that are set if this script is
+      # invoked as a task.
+      @optparser.top.list.each do |option|
+        option_name = option.switch_name.gsub('-', '_')
+        task_var = "PT_#{option_name}"
+
+        next unless ENV.has_key?(task_var)
+
+        @options[option_name.to_sym] = option.parse(ENV[task_var], []).last
+      end
+
+      @args = argv.dup
+      # parse! consumes all --flags and their arguments leaving
+      # file names behind.
+      @optparser.parse!(@args)
+    end
+
+    def run
+      if not REQUIRED_RUBY_VERSION.satisfied_by?(Gem::Version.new(RUBY_VERSION))
+        $stderr.puts('ERROR: %{name} requires Ruby %{required}. Current version is %{current}' %
+                     {name: NAME,
+                      required: REQUIRED_RUBY_VERSION,
+                      current: RUBY_VERSION})
+        return 1
+      end
+
+      case @action
+      when :show_help
+        $stdout.puts(@optparser.help)
+        return 0
+      when :show_version
+        $stdout.puts(VERSION)
+        return 0
+      end
+
+      self.main
+      return 0
+    rescue => e
+      message = if @options[:debug]
+                  ["ERROR #{e.class}: #{e.message}",
+                   e.backtrace].join("\n\t")
+                else
+                  "ERROR #{e.class}: #{e.message}"
+                end
+
+      $stderr.puts(message)
+      return 1
+    end
+
+    def main
+      TaskGenerator.new(@options).process
+    end
+  end
+end
+end
+
+if File.basename(__FILE__) == File.basename($PROGRAM_NAME)
+  exit_code = XBoltTasks::BoltTaskGen::CLI.new(ARGV).run
+  exit exit_code
+end
